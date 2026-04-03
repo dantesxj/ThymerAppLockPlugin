@@ -1,0 +1,8 @@
+{
+    "name": "App Lock",
+    "icon": "ti-lock",
+    "description": "PIN-based app lock. Locks automatically after inactivity. Fresh logins never prompt for a PIN — sign out to recover from a forgotten PIN.",
+    "custom": {
+        "lockTimeout": 120
+    }
+}
