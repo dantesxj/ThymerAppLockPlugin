@@ -1,3 +1,316 @@
+// @generated BEGIN thymer-ext-path-b (source: plugins/plugin-settings/ThymerExtPathBRuntime.js — edit that file, then npm run embed-path-b)
+/**
+ * ThymerExtPathB — shared path-B storage (Plugin Settings collection + localStorage mirror).
+ * Edit this file in the repo, then run `npm run embed-path-b` to refresh embedded copies inside each Path B plugin.
+ *
+ * API: ThymerExtPathB.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerExtPathB.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerExtPathB.openStorageDialog(plugin, { pluginId, modeKey, mirrorKeys, label, data, ui })
+ */
+(function pathBRuntime(g) {
+  if (g.ThymerExtPathB) return;
+
+  const COL_NAME = 'Plugin Settings';
+  const q = [];
+  let busy = false;
+
+  function drain() {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerExtPathB]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(drain, 450);
+      });
+  }
+
+  function enqueue(job) {
+    q.push(job);
+    drain();
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return all.find((c) => (c.getName?.() || '') === COL_NAME) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function readDoc(data, pluginId) {
+    const coll = await findColl(data);
+    if (!coll) return null;
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return null;
+    }
+    const r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) return null;
+    let raw = '';
+    try {
+      raw = r.text?.('settings_json') || '';
+    } catch (_) {}
+    if (!raw || !String(raw).trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function writeDoc(data, pluginId, doc) {
+    const coll = await findColl(data);
+    if (!coll) return;
+    const json = JSON.stringify(doc);
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    let r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) {
+      let guid = null;
+      try {
+        guid = coll.createRecord?.(pluginId);
+      } catch (_) {}
+      if (guid) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+          try {
+            const again = await coll.getAllRecords();
+            r = again.find((x) => x.guid === guid) || again.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+            if (r) break;
+          } catch (_) {}
+        }
+      }
+    }
+    if (!r) return;
+    try {
+      const pId = r.prop?.('plugin_id');
+      if (pId && typeof pId.set === 'function') pId.set(pluginId);
+    } catch (_) {}
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+  }
+
+  function showFirstRunDialog(ui, label, preferred, onPick) {
+    const id = 'thymerext-pathb-first-' + Math.random().toString(36).slice(2);
+    const box = document.createElement('div');
+    box.id = id;
+    box.style.cssText =
+      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = label + ' — where to store settings?';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const hint = document.createElement('div');
+    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
+    const mk = (t, sub, prim) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
+        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
+        ';color:inherit;';
+      const x = document.createElement('div');
+      x.textContent = t;
+      x.style.fontWeight = '600';
+      b.appendChild(x);
+      if (sub) {
+        const s = document.createElement('div');
+        s.textContent = sub;
+        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
+        b.appendChild(s);
+      }
+      return b;
+    };
+    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
+    const bSyn = mk('Sync via Plugin Settings', 'Workspace collection “' + COL_NAME + '”.', preferred === 'synced');
+    const fin = (m) => {
+      try {
+        box.remove();
+      } catch (_) {}
+      onPick(m);
+    };
+    bLoc.addEventListener('click', () => fin('local'));
+    bSyn.addEventListener('click', () => fin('synced'));
+    card.appendChild(title);
+    card.appendChild(hint);
+    card.appendChild(bLoc);
+    card.appendChild(bSyn);
+    box.appendChild(card);
+    document.body.appendChild(box);
+  }
+
+  g.ThymerExtPathB = {
+    COL_NAME,
+    enqueue,
+    async init(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      let mode = null;
+      try {
+        mode = localStorage.getItem(modeKey);
+      } catch (_) {}
+
+      const remote = await readDoc(data, pluginId);
+      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
+        mode = remote.storageMode;
+        try {
+          localStorage.setItem(modeKey, mode);
+        } catch (_) {}
+      }
+
+      if (!mode) {
+        const coll = await findColl(data);
+        const preferred = coll ? 'synced' : 'local';
+        await new Promise((outerResolve) => {
+          enqueue(async () => {
+            const picked = await new Promise((r) => {
+              showFirstRunDialog(ui, label, preferred, r);
+            });
+            try {
+              localStorage.setItem(modeKey, picked);
+            } catch (_) {}
+            outerResolve(picked);
+          });
+        });
+        try {
+          mode = localStorage.getItem(modeKey);
+        } catch (_) {}
+      }
+
+      plugin._pathBMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pathBPluginId = pluginId;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+
+      if (plugin._pathBMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+        for (const k of keys) {
+          const v = remote.payload[k];
+          if (typeof v === 'string') {
+            try {
+              localStorage.setItem(k, v);
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (plugin._pathBMode === 'synced') {
+        try {
+          await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+        } catch (_) {}
+      }
+    },
+
+    scheduleFlush(plugin, mirrorKeys) {
+      if (plugin._pathBMode !== 'synced') return;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (plugin._pathBFlushTimer) clearTimeout(plugin._pathBFlushTimer);
+      plugin._pathBFlushTimer = setTimeout(() => {
+        plugin._pathBFlushTimer = null;
+        const data = plugin.data;
+        const pid = plugin._pathBPluginId;
+        if (!pid || !data) return;
+        g.ThymerExtPathB.flushNow(data, pid, keys).catch((e) => console.error('[ThymerExtPathB] flush', e));
+      }, 500);
+    },
+
+    async flushNow(data, pluginId, mirrorKeys) {
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      const payload = {};
+      for (const k of keys) {
+        try {
+          const v = localStorage.getItem(k);
+          if (v !== null) payload[k] = v;
+        } catch (_) {}
+      }
+      const doc = {
+        v: 1,
+        storageMode: 'synced',
+        updatedAt: new Date().toISOString(),
+        payload,
+      };
+      await writeDoc(data, pluginId, doc);
+    },
+
+    async openStorageDialog(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      const cur = plugin._pathBMode === 'synced' ? 'synced' : 'local';
+      const pick = await new Promise((resolve) => {
+        const close = (v) => {
+          try {
+            box.remove();
+          } catch (_) {}
+          resolve(v);
+        };
+        const box = document.createElement('div');
+        box.style.cssText =
+          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+        box.addEventListener('click', (e) => {
+          if (e.target === box) close(null);
+        });
+        const card = document.createElement('div');
+        card.style.cssText =
+          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
+        card.addEventListener('click', (e) => e.stopPropagation());
+        const t = document.createElement('div');
+        t.textContent = label + ' — storage';
+        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
+        const b1 = document.createElement('button');
+        b1.type = 'button';
+        b1.textContent = 'This device only';
+        const b2 = document.createElement('button');
+        b2.type = 'button';
+        b2.textContent = 'Sync via Plugin Settings';
+        [b1, b2].forEach((b) => {
+          b.style.cssText =
+            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
+        });
+        b1.addEventListener('click', () => close('local'));
+        b2.addEventListener('click', () => close('synced'));
+        const bx = document.createElement('button');
+        bx.type = 'button';
+        bx.textContent = 'Cancel';
+        bx.style.cssText =
+          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
+        bx.addEventListener('click', () => close(null));
+        card.appendChild(t);
+        card.appendChild(b1);
+        card.appendChild(b2);
+        card.appendChild(bx);
+        box.appendChild(card);
+        document.body.appendChild(box);
+      });
+      if (!pick || pick === cur) return;
+      try {
+        localStorage.setItem(modeKey, pick);
+      } catch (_) {}
+      plugin._pathBMode = pick === 'synced' ? 'synced' : 'local';
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+      ui.addToaster?.({
+        title: label,
+        message: 'Storage: ' + (pick === 'synced' ? 'synced' : 'local only'),
+        dismissible: true,
+        autoDestroyTime: 3500,
+      });
+    },
+  };
+
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+// @generated END thymer-ext-path-b
+
+
 /**
  * App Lock Plugin for Thymer
  *
@@ -24,10 +337,31 @@ class Plugin extends AppPlugin {
 
   _STORAGE_KEY_HASH  = 'thymer_applock_pin_hash_v1';
   _STORAGE_KEY_STATE = 'thymer_applock_state_v1';
+  /** Set on `pagehide` so the next process launch (desktop) or full reload asks for the PIN again. */
+  _STORAGE_KEY_RESUME_GATE = 'thymer_applock_resume_gate_v1';
 
-  onLoad() {
+  _pathBMirrorKeys() {
+    return [this._STORAGE_KEY_HASH, this._STORAGE_KEY_STATE, this._STORAGE_KEY_RESUME_GATE];
+  }
+
+  _pathBFlush() {
+    globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._pathBMirrorKeys());
+  }
+
+  async onLoad() {
+    await (globalThis.ThymerExtPathB?.init?.({
+      plugin: this,
+      pluginId: 'app-lock',
+      modeKey: 'thymerext_ps_mode_app_lock',
+      mirrorKeys: () => this._pathBMirrorKeys(),
+      label: 'App Lock',
+      data: this.data,
+      ui: this.ui,
+    }) ?? (console.warn('[App Lock] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
     const cfg = this.getConfiguration?.()?.custom || {};
     this._timeoutMs = Math.max(10, Number(cfg.lockTimeout) || 120) * 1000;
+    this._signingOut = false;
+    this._pageHideBound = null;
 
     this._injectStyles();
 
@@ -57,6 +391,23 @@ class Plugin extends AppPlugin {
         },
       })
     );
+    this._commands.push(
+      this.ui.addCommandPaletteCommand({
+        label: 'App Lock: Storage location…',
+        icon: 'ti-database',
+        onSelected: () => {
+          globalThis.ThymerExtPathB?.openStorageDialog?.({
+            plugin: this,
+            pluginId: 'app-lock',
+            modeKey: 'thymerext_ps_mode_app_lock',
+            mirrorKeys: () => this._pathBMirrorKeys(),
+            label: 'App Lock',
+            data: this.data,
+            ui: this.ui,
+          });
+        },
+      })
+    );
 
     // Activity events to reset idle timer
     this._activityBound = () => this._onActivity();
@@ -65,14 +416,25 @@ class Plugin extends AppPlugin {
       document.addEventListener(ev, this._activityBound, { passive: true, capture: true });
     }
 
-    // Determine initial state
-    const hasPin    = !!localStorage.getItem(this._STORAGE_KEY_HASH);
-    const wasLocked = localStorage.getItem(this._STORAGE_KEY_STATE) === 'locked';
+    // Next cold open / reload with PIN: require unlock (desktop restore, etc.)
+    this._pageHideBound = () => this._onPageHideResumeGate();
+    window.addEventListener('pagehide', this._pageHideBound);
 
-    if (wasLocked && hasPin) {
+    // Determine initial state
+    const hasPin     = !!localStorage.getItem(this._STORAGE_KEY_HASH);
+    const wasLocked  = localStorage.getItem(this._STORAGE_KEY_STATE) === 'locked';
+    const resumeGate = localStorage.getItem(this._STORAGE_KEY_RESUME_GATE) === '1';
+
+    if (resumeGate && hasPin) {
+      try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
+    }
+
+    if (hasPin && (wasLocked || resumeGate)) {
       this._showLockOverlay();
     } else {
+      try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      this._pathBFlush();
       this._resetIdleTimer();
     }
   }
@@ -80,6 +442,10 @@ class Plugin extends AppPlugin {
   onUnload() {
     this._clearIdleTimer();
     this._removeOverlay();
+    if (this._pageHideBound) {
+      try { window.removeEventListener('pagehide', this._pageHideBound); } catch (e) { /* ignore */ }
+      this._pageHideBound = null;
+    }
     for (const cmd of this._commands) {
       try { cmd?.remove?.(); } catch (e) { /* ignore */ }
     }
@@ -93,11 +459,22 @@ class Plugin extends AppPlugin {
     }
   }
 
+  _onPageHideResumeGate() {
+    if (this._signingOut) return;
+    try {
+      if (!localStorage.getItem(this._STORAGE_KEY_HASH)) return;
+      if (this._overlayEl) return;
+      localStorage.setItem(this._STORAGE_KEY_RESUME_GATE, '1');
+      this._pathBFlush();
+    } catch (e) { /* ignore */ }
+  }
+
   // ─── Public ───────────────────────────────────────────────────────────────
 
   lock() {
     this._clearIdleTimer();
     localStorage.setItem(this._STORAGE_KEY_STATE, 'locked');
+    this._pathBFlush();
     this._showLockOverlay();
   }
 
@@ -167,6 +544,34 @@ class Plugin extends AppPlugin {
     });
   }
 
+  /** Delete every IndexedDB the browser reports (Thymer session lives here; fixed names are not enough). */
+  async _deleteAllIndexedDatabases() {
+    const names = new Set(['thymer', 'db', 'app', 'cache', 'auth', 'session']);
+    try {
+      if (typeof indexedDB.databases === 'function') {
+        const list = await indexedDB.databases();
+        for (const d of list || []) {
+          if (d && d.name) names.add(d.name);
+        }
+      }
+    } catch (e) {
+      console.warn('[AppLock] indexedDB.databases:', e);
+    }
+    await Promise.all(
+      [...names].map(
+        (name) =>
+          new Promise((resolve) => {
+            try {
+              const r = indexedDB.deleteDatabase(name);
+              r.onsuccess = r.onblocked = r.onerror = () => resolve();
+            } catch (_) {
+              resolve();
+            }
+          })
+      )
+    );
+  }
+
   // ─── Sign out ─────────────────────────────────────────────────────────────
   //
   // How Thymer's auth works (confirmed from console):
@@ -178,16 +583,19 @@ class Plugin extends AppPlugin {
   // Strategy:
   //  1. Unregister all Service Workers — breaks the cache intercept
   //  2. Clear all SW caches — forces a true network fetch on reload
-  //  3. Clear all localStorage EXCEPT our PIN hash (so PIN survives)
-  //  4. Clear sessionStorage
-  //  5. Expire all cookies
-  //  6. Navigate to the root URL with cache-busting — Thymer finds no
+  //  3. Clear all IndexedDB databases — removes any cached auth/session data
+  //  4. Clear all localStorage EXCEPT our PIN hash (so PIN survives)
+  //  5. Clear sessionStorage
+  //  6. Expire all cookies
+  //  7. Navigate to the root URL with cache-busting — Thymer finds no
   //     session and renders the Login screen
 
   async _signOut() {
+    this._signingOut = true;
     // Keep PIN hash but mark as unlocked (fresh login won't trigger lock)
     const pinHash = localStorage.getItem(this._STORAGE_KEY_HASH);
     localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+    try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
 
     // 1. Unregister all Service Workers
     try {
@@ -209,17 +617,35 @@ class Plugin extends AppPlugin {
       console.warn('[AppLock] Cache clear:', e);
     }
 
-    // 3. Clear ALL localStorage, then restore just our PIN hash
+    // 3. Clear IndexedDB — enumerate real DB names (Thymer dev pattern); fallback to common names
+    try {
+      await this._deleteAllIndexedDatabases();
+    } catch (e) {
+      console.warn('[AppLock] IndexedDB clear:', e);
+    }
+
+    // 4. Clear ALL localStorage, then restore PIN hash + Path B mode keys (other plugins)
+    const pathBModes = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('thymerext_ps_mode_')) pathBModes[k] = localStorage.getItem(k);
+      }
+    } catch (_) {}
     try {
       localStorage.clear();
       if (pinHash) localStorage.setItem(this._STORAGE_KEY_HASH, pinHash);
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      for (const k of Object.keys(pathBModes)) {
+        const v = pathBModes[k];
+        if (v != null) try { localStorage.setItem(k, v); } catch (_) {}
+      }
     } catch (e) { /* ignore */ }
 
-    // 4. Clear sessionStorage
+    // 5. Clear sessionStorage
     try { sessionStorage.clear(); } catch (e) { /* ignore */ }
 
-    // 5. Expire all cookies
+    // 6. Expire all cookies
     try {
       document.cookie.split(';').forEach((c) => {
         const name = c.split('=')[0].trim();
@@ -228,7 +654,7 @@ class Plugin extends AppPlugin {
       });
     } catch (e) { /* ignore */ }
 
-    // 6. Navigate to root with a cache-busting query string.
+    // 7. Navigate to root with a cache-busting query string.
     //    With the SW gone and caches empty, Thymer fetches fresh from the
     //    network, finds no session, and shows the Login screen.
     //    The ?_signout param is ignored by Thymer but prevents any
@@ -328,6 +754,7 @@ class Plugin extends AppPlugin {
       if (hash === storedHash) {
         overlay.classList.add('tal-overlay--unlocking');
         localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+        this._pathBFlush();
         setTimeout(() => {
           this._removeOverlay();
           this._resetIdleTimer();
@@ -452,6 +879,7 @@ class Plugin extends AppPlugin {
       const hash = await this._hashPin(p1);
       localStorage.setItem(this._STORAGE_KEY_HASH, hash);
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      this._pathBFlush();
 
       this._showMsg(msg, 'PIN saved!', 'ok');
       setTimeout(() => {

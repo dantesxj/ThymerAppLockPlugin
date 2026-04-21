@@ -1,12 +1,43 @@
 # ThymerAppLockPlugin
-PIN-based app lock plugin. Locks automatically after inactivity.
 
-**⚠️‼️ This is in progress and needs support before being actually functional... right now the 'sign out' option DOES NOT WORK... it will bypass the pin and just return you to the main workspace. ‼️⚠️**
+PIN-based Thymer app lock plugin with inactivity auto-lock, manual lock controls, and a hardened sign-out flow.
 
-Behaviour:
- - Fresh login: NO lock screen. Idle timer starts silently.
- - After 2 min idle: lock screen appears, requiring PIN.
- - Lock screen: enter PIN to unlock, OR sign out (back to Thymer login).
- - Forgot PIN: sign out → log back in → use "Change Lock PIN" in Command Palette.
- - Command Palette → "Lock App": manual lock at any time.
- - Command Palette → "Change Lock PIN": set/change PIN freely — no current PIN required.
+## Current status
+
+Working in current rollout.
+
+## What it does
+
+- Fresh login: no immediate PIN prompt; idle timer starts.
+- Auto-lock after inactivity (default: 120 seconds).
+- Manual lock command from Command Palette.
+- Unlock via PIN.
+- Sign out from lock screen to return to Thymer login.
+
+## Command Palette commands
+
+- `Lock App` - lock immediately (if a PIN exists).
+- `Change Lock PIN` - set or change PIN while unlocked.
+- `App Lock: Storage location…` - choose local-only vs synced settings storage.
+
+## Config
+
+`App Lock.json`:
+
+```json
+{
+  "name": "App Lock",
+  "icon": "ti-lock",
+  "description": "PIN-based app lock. Locks automatically after inactivity. Fresh logins never prompt for a PIN — sign out to recover from a forgotten PIN.",
+  "custom": {
+    "lockTimeout": 120
+  }
+}
+```
+
+`lockTimeout` is in seconds, minimum 10.
+
+## Notes
+
+- Uses a resume gate so cold re-open/reload with PIN set requires unlock.
+- Includes Path B storage support (`Plugin Settings` collection) with localStorage mirror fallback.
