@@ -6,6 +6,8 @@ PIN-based Thymer app lock plugin with inactivity auto-lock, manual lock controls
 
 Working in current rollout.
 
+‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
+
 ## What it does
 
 - Fresh login: no immediate PIN prompt; idle timer starts.
