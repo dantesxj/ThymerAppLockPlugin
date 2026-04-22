@@ -334,6 +334,7 @@ class Plugin extends AppPlugin {
   _overlayEl     = null;
   _idleTimer     = null;
   _activityBound = null;
+  _overlayFocusGuard = null;
 
   _STORAGE_KEY_HASH  = 'thymer_applock_pin_hash_v1';
   _STORAGE_KEY_STATE = 'thymer_applock_state_v1';
@@ -498,8 +499,34 @@ class Plugin extends AppPlugin {
   // ─── Overlay helpers ──────────────────────────────────────────────────────
 
   _removeOverlay() {
+    this._detachOverlayFocusGuard();
     this._overlayEl?.remove();
     this._overlayEl = null;
+  }
+
+  _detachOverlayFocusGuard() {
+    if (this._overlayFocusGuard) {
+      try { document.removeEventListener('focusin', this._overlayFocusGuard, true); } catch (_) {}
+      this._overlayFocusGuard = null;
+    }
+  }
+
+  /** Keep focus inside the lock / change-PIN overlay so host panels do not steal keystrokes. */
+  _attachOverlayFocusGuard(overlay) {
+    this._detachOverlayFocusGuard();
+    this._overlayFocusGuard = (e) => {
+      if (!this._overlayEl || this._overlayEl !== overlay) return;
+      const t = e.target;
+      if (!t || overlay.contains(t)) return;
+      const prefer =
+        overlay.querySelector('#tal-pin-input') ||
+        overlay.querySelector('#tal-pin-new') ||
+        overlay.querySelector('input:not([disabled]), button:not([disabled])');
+      if (prefer && typeof prefer.focus === 'function') {
+        try { prefer.focus({ preventScroll: true }); } catch (_) { try { prefer.focus(); } catch (_) {} }
+      }
+    };
+    document.addEventListener('focusin', this._overlayFocusGuard, true);
   }
 
   _buildBaseOverlay() {
@@ -787,6 +814,7 @@ class Plugin extends AppPlugin {
     });
 
     this._trapFocusIn(overlay);
+    this._attachOverlayFocusGuard(overlay);
     setTimeout(() => input.focus(), 80);
   }
 
@@ -898,6 +926,7 @@ class Plugin extends AppPlugin {
     );
 
     this._trapFocusIn(overlay);
+    this._attachOverlayFocusGuard(overlay);
     setTimeout(() => pinNew.focus(), 80);
   }
 
