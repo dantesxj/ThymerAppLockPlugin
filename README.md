@@ -24,7 +24,7 @@ Working in current rollout.
 
 ## Config
 
-`App Lock.json`:
+`plugin.json`:
 
 ```json
 {
