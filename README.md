@@ -42,4 +42,4 @@ Working in current rollout.
 ## Notes
 
 - Uses a resume gate so cold re-open/reload with PIN set requires unlock.
-- Includes Path B storage support (`Plugin Settings` collection) with localStorage mirror fallback.
+- Includes Path B storage support (**Plugin Backend** collection; legacy **Plugin Settings** name still resolved) with localStorage mirror fallback.
