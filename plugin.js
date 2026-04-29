@@ -8,6 +8,9 @@
  * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
  *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
  *
+ * Create dedupe: Web Locks + **per-workspace** localStorage lease/recent-create keys (workspaceGuid from
+ * `data.getActiveUsers()[0]`), plus abort if an exact-named Plugin Backend collection already exists.
+ *
  * Rows:
  * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
  * - **Other rows** (`record_kind` = `log`, `config`, …): same **Plugin** field (`plugin`) for filtering;
@@ -859,18 +862,62 @@
     return null;
   }
 
-  const LS_CREATE_LEASE_KEY = 'thymerext_plugin_backend_create_lease_v1';
-  const LS_RECENT_CREATE_KEY = 'thymerext_plugin_backend_recent_create_v1';
-  const LS_RECENT_CREATE_ATTEMPT_KEY = 'thymerext_plugin_backend_recent_create_attempt_v1';
+  /** Unscoped keys (legacy); runtime uses {@link scopedPbLsKey} per workspace. */
+  const LS_CREATE_LEASE_BASE = 'thymerext_plugin_backend_create_lease_v1';
+  const LS_RECENT_CREATE_BASE = 'thymerext_plugin_backend_recent_create_v1';
+  const LS_RECENT_CREATE_ATTEMPT_BASE = 'thymerext_plugin_backend_recent_create_attempt_v1';
+
+  function workspaceSlugFromData(data) {
+    try {
+      const u = data && typeof data.getActiveUsers === 'function' ? data.getActiveUsers() : null;
+      const g = u && u[0] && u[0].workspaceGuid;
+      const s = g != null ? String(g).trim() : '';
+      if (s) return s.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 120);
+    } catch (_) {}
+    return '_unknown_ws';
+  }
+
+  function scopedPbLsKey(base, data) {
+    return `${base}__${workspaceSlugFromData(data)}`;
+  }
+
+  /** Count collections whose sidebar/title name is exactly Plugin Backend (or legacy). */
+  async function countExactPluginBackendNamedCollections(data) {
+    let all;
+    try {
+      all = await data.getAllCollections();
+    } catch (_) {
+      return 0;
+    }
+    if (!Array.isArray(all)) return 0;
+    let n = 0;
+    for (const c of all) {
+      try {
+        const nm = collectionDisplayName(c);
+        if (nm === COL_NAME || nm === COL_NAME_LEGACY) n += 1;
+      } catch (_) {}
+    }
+    return n;
+  }
 
   /**
    * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
+   * Lease keys are **per workspace** so switching workspaces does not inherit another vault’s lease / cooldown.
    * @returns {{ denied: boolean, release: () => void }}
    */
-  async function acquirePluginBackendCreationLease(maxWaitMs) {
+  async function acquirePluginBackendCreationLease(maxWaitMs, data) {
+    const locksOk =
+      typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function';
     const noop = { denied: false, release() {} };
     const ls = getSharedThymerLocalStorage();
-    if (!ls) return noop;
+    if (!ls) {
+      if (locksOk) return noop;
+      if (DEBUG_COLLECTIONS) {
+        dlogPathB('lease_denied_no_localstorage_no_locks', { ws: workspaceSlugFromData(data) });
+      }
+      return { denied: true, release() {} };
+    }
+    const leaseKey = scopedPbLsKey(LS_CREATE_LEASE_BASE, data);
     const holder =
       (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
       `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -879,7 +926,7 @@
     let sawContention = false;
     while (Date.now() < deadline) {
       try {
-        const raw = ls.getItem(LS_CREATE_LEASE_KEY);
+        const raw = ls.getItem(leaseKey);
         let busy = false;
         if (raw) {
           let j = null;
@@ -897,20 +944,20 @@
         }
         const exp = Date.now() + 45000;
         const payload = JSON.stringify({ h: holder, exp });
-        ls.setItem(LS_CREATE_LEASE_KEY, payload);
+        ls.setItem(leaseKey, payload);
         await new Promise((r) => setTimeout(r, 0));
-        if (ls.getItem(LS_CREATE_LEASE_KEY) === payload) {
+        if (ls.getItem(leaseKey) === payload) {
           acquired = true;
-          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention });
+          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention, leaseKey });
           break;
         }
       } catch (_) {
-        return noop;
+        return locksOk ? noop : { denied: true, release() {} };
       }
       await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
     }
     if (!acquired) {
-      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention });
+      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention, leaseKey });
       return { denied: true, release() {} };
     }
     return {
@@ -919,7 +966,7 @@
         if (!acquired) return;
         acquired = false;
         try {
-          const cur = ls.getItem(LS_CREATE_LEASE_KEY);
+          const cur = ls.getItem(leaseKey);
           if (!cur) return;
           let j = null;
           try {
@@ -927,25 +974,25 @@
           } catch (_) {
             return;
           }
-          if (j && j.h === holder) ls.removeItem(LS_CREATE_LEASE_KEY);
+          if (j && j.h === holder) ls.removeItem(leaseKey);
         } catch (_) {}
       },
     };
   }
 
-  function noteRecentPluginBackendCreate() {
+  function noteRecentPluginBackendCreate(data) {
     const ls = getSharedThymerLocalStorage();
-    if (!ls) return;
+    if (!ls || !data) return;
     try {
-      ls.setItem(LS_RECENT_CREATE_KEY, String(Date.now()));
+      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data), String(Date.now()));
     } catch (_) {}
   }
 
-  function getRecentPluginBackendCreateAgeMs() {
+  function getRecentPluginBackendCreateAgeMs(data) {
     const ls = getSharedThymerLocalStorage();
-    if (!ls) return null;
+    if (!ls || !data) return null;
     try {
-      const raw = ls.getItem(LS_RECENT_CREATE_KEY);
+      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data));
       const ts = Number(raw);
       if (!Number.isFinite(ts) || ts <= 0) return null;
       return Date.now() - ts;
@@ -954,19 +1001,19 @@
     }
   }
 
-  function noteRecentPluginBackendCreateAttempt() {
+  function noteRecentPluginBackendCreateAttempt(data) {
     const ls = getSharedThymerLocalStorage();
-    if (!ls) return;
+    if (!ls || !data) return;
     try {
-      ls.setItem(LS_RECENT_CREATE_ATTEMPT_KEY, String(Date.now()));
+      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data), String(Date.now()));
     } catch (_) {}
   }
 
-  function getRecentPluginBackendCreateAttemptAgeMs() {
+  function getRecentPluginBackendCreateAttemptAgeMs(data) {
     const ls = getSharedThymerLocalStorage();
-    if (!ls) return null;
+    if (!ls || !data) return null;
     try {
-      const raw = ls.getItem(LS_RECENT_CREATE_ATTEMPT_KEY);
+      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data));
       const ts = Number(raw);
       if (!Number.isFinite(ts) || ts <= 0) return null;
       return Date.now() - ts;
@@ -1193,12 +1240,12 @@
         void 0;
       }
       if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const lease = await acquirePluginBackendCreationLease(14000);
+      const lease = await acquirePluginBackendCreationLease(14000, data);
       if (lease.denied) return;
       try {
         if (await findColl(data)) return;
         if (await hasPluginBackendOnWorkspace(data)) return;
-        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs();
+        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
           // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
           for (let i = 0; i < 10; i++) {
@@ -1208,7 +1255,7 @@
           }
           return;
         }
-        const recentAge = getRecentPluginBackendCreateAgeMs();
+        const recentAge = getRecentPluginBackendCreateAgeMs(data);
         if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
           // Another plugin/runtime likely just created it; let collection list/indexing settle first.
           for (let i = 0; i < 8; i++) {
@@ -1217,7 +1264,14 @@
             if (await hasPluginBackendOnWorkspace(data)) return;
           }
         }
-        noteRecentPluginBackendCreateAttempt();
+        noteRecentPluginBackendCreateAttempt(data);
+        const exactN = await countExactPluginBackendNamedCollections(data);
+        if (exactN >= 1) {
+          if (DEBUG_COLLECTIONS) {
+            dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
+          }
+          return;
+        }
         const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
         if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
           return;
@@ -1232,7 +1286,7 @@
           ok = await coll.saveConfiguration(conf);
         }
         if (ok === false) return;
-        noteRecentPluginBackendCreate();
+        noteRecentPluginBackendCreate(data);
         await new Promise((r) => setTimeout(r, 250));
       } finally {
         try {
@@ -1688,7 +1742,7 @@ class Plugin extends AppPlugin {
   _STORAGE_KEY_STATE = 'thymer_applock_state_v1';
   /** Set on `pagehide` so the next process launch (desktop) or full reload asks for the PIN again. */
   _STORAGE_KEY_RESUME_GATE = 'thymer_applock_resume_gate_v1';
-  /** When set, idle auto-lock and footer quick-lock are off until cleared (synced via Plugin Backend mirror). */
+  /** When set, idle auto-lock and footer quick-lock are off until cleared (synced like other Path B / mirror keys). */
   _STORAGE_KEY_SUSPENDED = 'thymer_applock_suspended_v1';
 
   _pluginSettingsMirrorKeys() {
@@ -2505,15 +2559,38 @@ class Plugin extends AppPlugin {
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 20px;
+        padding: clamp(12px, 3vw, 24px);
         box-sizing: border-box;
-        background: var(--color-bg-950, #0d1117);
+        /* Theme-tinted scrim + light blur (pre Theme-Thyme / cmdpal experiments). */
+        background-color: color-mix(in srgb, var(--color-bg-950, #0d1117) 28%, transparent);
+        backdrop-filter: blur(18px) saturate(1.15);
+        -webkit-backdrop-filter: blur(18px) saturate(1.15);
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-text-100, #fff) 6%, transparent);
         background-image:
-          radial-gradient(ellipse 80% 60% at 50% 0%, rgba(255,255,255,0.03) 0%, transparent 70%),
-          url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+          radial-gradient(
+            ellipse 90% 60% at 50% 0%,
+            color-mix(in srgb, var(--color-primary-500, var(--color-primary-400, #cba6f7)) 14%, transparent) 0%,
+            transparent 62%
+          ),
+          url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
         animation: tal-fadein 0.25s ease both;
         user-select: none;
         -webkit-app-region: no-drag;
+      }
+
+      @supports not (background-color: color-mix(in srgb, black 50%, white)) {
+        .tal-overlay {
+          background-color: rgba(13, 17, 23, 0.26);
+        }
+      }
+
+      @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+        .tal-overlay {
+          background-color: var(--color-bg-950, #0d1117);
+          backdrop-filter: none;
+          -webkit-backdrop-filter: none;
+          box-shadow: none;
+        }
       }
 
       @keyframes tal-fadein {
@@ -2532,24 +2609,26 @@ class Plugin extends AppPlugin {
 
       .tal-card {
         width: 100%;
-        max-width: 380px;
-        padding: 40px 36px 32px;
+        max-width: min(380px, calc(100vw - 24px));
+        padding: clamp(24px, 5vh, 40px) clamp(20px, 4vw, 36px) clamp(20px, 4vw, 32px);
         border-radius: 14px;
         box-sizing: border-box;
+        font-family: var(--font-sans, system-ui);
+        color: var(--color-text-100, #ffffff);
         background: var(--color-bg-800, #181825);
-        border: 1px solid rgba(255,255,255,0.1);
+        border: 1px solid color-mix(in srgb, var(--color-text-100, #fff) 10%, transparent);
         box-shadow:
-          0 0 0 1px rgba(255,255,255,0.04) inset,
-          0 32px 80px rgba(0,0,0,0.6),
-          0 8px 24px rgba(0,0,0,0.4);
+          0 0 0 1px color-mix(in srgb, var(--color-text-100, #fff) 4%, transparent) inset,
+          0 32px 80px color-mix(in srgb, var(--color-bg-950, #000) 55%, transparent),
+          0 8px 24px rgba(0, 0, 0, 0.35);
         display: flex;
         flex-direction: column;
         align-items: stretch;
-        gap: 16px;
+        gap: clamp(12px, 2vh, 16px);
         animation: tal-slidein 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both;
       }
 
-      .tal-card--setup { max-width: 400px; }
+      .tal-card--setup { max-width: min(400px, calc(100vw - 24px)); }
 
       @keyframes tal-slidein {
         from { opacity: 0; transform: translateY(24px) scale(0.97); }
@@ -2588,20 +2667,29 @@ class Plugin extends AppPlugin {
         justify-content: center;
         color: #fff;
         margin-bottom: 4px;
-        background: linear-gradient(135deg, var(--color-primary-600, #9d71e8) 0%, var(--color-primary-400, #cba6f7) 100%);
-        box-shadow: 0 8px 24px rgba(203,166,247,0.35);
+        background: linear-gradient(
+          135deg,
+          var(--color-primary-600, #9d71e8) 0%,
+          var(--color-primary-400, #cba6f7) 100%
+        );
+        box-shadow: 0 8px 24px color-mix(in srgb, var(--color-primary-400, #cba6f7) 35%, transparent);
       }
 
       .tal-lock-icon svg { width: 26px; height: 26px; }
 
       .tal-lock-icon--neutral {
-        background: linear-gradient(135deg, var(--color-bg-500, #45475a) 0%, var(--color-bg-300, #6c7086) 100%);
-        box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+        background: linear-gradient(
+          135deg,
+          var(--color-bg-500, #45475a) 0%,
+          var(--color-bg-300, #6c7086) 100%
+        );
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+        color: var(--color-text-100, #fff);
       }
 
       .tal-title {
         font-family: var(--font-serif, var(--font-sans, system-ui));
-        font-size: 20px;
+        font-size: clamp(18px, 2.8vw, 20px);
         font-weight: 700;
         color: var(--color-text-100, #ffffff);
         margin: 0;
@@ -2648,13 +2736,13 @@ class Plugin extends AppPlugin {
       }
 
       .tal-input::placeholder {
-        color: var(--color-bg-300, rgba(255,255,255,0.2));
+        color: var(--color-bg-300, rgba(255, 255, 255, 0.2));
         letter-spacing: 0.15em;
       }
 
       .tal-input:focus {
         border-color: var(--color-primary-400, #cba6f7);
-        box-shadow: 0 0 0 3px rgba(203,166,247,0.2);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary-400, #cba6f7) 22%, transparent);
       }
 
       .tal-input--pin {
@@ -2695,19 +2783,25 @@ class Plugin extends AppPlugin {
         box-sizing: border-box;
       }
 
-      .tal-btn:focus-visible { box-shadow: 0 0 0 3px rgba(203,166,247,0.4); }
+      .tal-btn:focus-visible {
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary-400, #cba6f7) 45%, transparent);
+      }
       .tal-btn:disabled { opacity: 0.5; cursor: default; }
 
       .tal-btn--primary {
-        background: linear-gradient(135deg, var(--color-primary-600, #9d71e8) 0%, var(--color-primary-400, #cba6f7) 100%);
+        background: linear-gradient(
+          135deg,
+          var(--color-primary-600, #9d71e8) 0%,
+          var(--color-primary-400, #cba6f7) 100%
+        );
         color: var(--color-bg-900, #11111b);
-        box-shadow: 0 4px 16px rgba(203,166,247,0.3);
+        box-shadow: 0 4px 16px color-mix(in srgb, var(--color-primary-400, #cba6f7) 30%, transparent);
       }
 
       .tal-btn--primary:hover:not(:disabled) {
-        opacity: 0.9;
+        opacity: 0.92;
         transform: translateY(-1px);
-        box-shadow: 0 6px 20px rgba(203,166,247,0.4);
+        box-shadow: 0 6px 20px color-mix(in srgb, var(--color-primary-400, #cba6f7) 40%, transparent);
       }
 
       .tal-btn--primary:active:not(:disabled) { transform: translateY(0); }
@@ -2775,13 +2869,17 @@ class Plugin extends AppPlugin {
       }
 
       @media (max-height: 600px) {
-        .tal-card { padding: 26px 28px 22px; gap: 12px; }
-        .tal-lock-icon { width: 42px; height: 42px; }
-        .tal-title { font-size: 17px; }
+        .tal-card { padding: clamp(18px, 4vh, 28px) clamp(18px, 3vw, 28px); gap: 12px; }
+        .tal-lock-icon { width: 44px; height: 44px; border-radius: 12px; }
+        .tal-lock-icon svg { width: 22px; height: 22px; }
+        .tal-title { font-size: clamp(16px, 2.5vw, 18px); }
       }
 
       @media (max-width: 440px) {
-        .tal-card { padding: 32px 24px 24px; border-radius: 12px; }
+        .tal-card {
+          padding: clamp(20px, 5vw, 28px) clamp(18px, 4vw, 24px);
+          border-radius: 12px;
+        }
       }
     `);
   }
