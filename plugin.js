@@ -1,4 +1,4 @@
-// @generated BEGIN thymer-plugin-settings (source: plugins/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
+// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
 /**
  * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
  * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
@@ -610,7 +610,7 @@
               console.error(
                 '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
                 pf.type,
-                '— check collection General tab or re-import plugins/plugin-settings/Plugin Backend.json.'
+                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
               );
             }
           } catch (_) {}
@@ -1653,8 +1653,6 @@
   };
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
-
-
 /**
  * App Lock Plugin for Thymer
  *
@@ -1665,6 +1663,8 @@
  *  - Forgot PIN: sign out → log back in → use "Change Lock PIN" in Command Palette.
  *  - Command Palette → "Lock App": manual lock at any time.
  *  - Command Palette → "Change Lock PIN": set/change PIN freely — no current PIN required.
+ *  - Status bar lock icon: click = lock now; hold ≈0.5s = suspend/resume idle protection.
+ *  - Command Palette → suspend/resume protection (same as hold toggle).
  *
  * PIN is stored as a SHA-256 hash in localStorage — never the PIN itself.
  *
@@ -1679,14 +1679,20 @@ class Plugin extends AppPlugin {
   _idleTimer     = null;
   _activityBound = null;
   _overlayFocusGuard = null;
+  _overlayFocusRedirecting = false;
+  _statusItem = null;
+  /** Removes pointer listeners from status bar element (see _mountStatusBar). */
+  _statusBarPointerCleanup = null;
 
   _STORAGE_KEY_HASH  = 'thymer_applock_pin_hash_v1';
   _STORAGE_KEY_STATE = 'thymer_applock_state_v1';
   /** Set on `pagehide` so the next process launch (desktop) or full reload asks for the PIN again. */
   _STORAGE_KEY_RESUME_GATE = 'thymer_applock_resume_gate_v1';
+  /** When set, idle auto-lock and footer quick-lock are off until cleared (synced via Plugin Backend mirror). */
+  _STORAGE_KEY_SUSPENDED = 'thymer_applock_suspended_v1';
 
   _pluginSettingsMirrorKeys() {
-    return [this._STORAGE_KEY_HASH, this._STORAGE_KEY_STATE, this._STORAGE_KEY_RESUME_GATE];
+    return [this._STORAGE_KEY_HASH, this._STORAGE_KEY_STATE, this._STORAGE_KEY_RESUME_GATE, this._STORAGE_KEY_SUSPENDED];
   }
 
   _pluginSettingsFlush() {
@@ -1754,6 +1760,56 @@ class Plugin extends AppPlugin {
       })
     );
 
+    this._commands.push(
+      this.ui.addCommandPaletteCommand({
+        label: 'App Lock: Suspend protection',
+        icon: 'lock-open',
+        onSelected: () => {
+          if (this._isSuspended()) {
+            this.ui.addToaster({
+              title: 'Already suspended',
+              message: 'Idle lock and the status bar quick lock are off. Use “App Lock: Resume protection” or hold the lock icon.',
+              dismissible: true,
+              autoDestroyTime: 4000,
+            });
+            return;
+          }
+          this._setSuspended(true);
+          this.ui.addToaster({
+            title: 'App Lock suspended',
+            message: 'Hold the status bar lock icon or use the command palette to resume.',
+            dismissible: true,
+            autoDestroyTime: 4000,
+          });
+        },
+      })
+    );
+
+    this._commands.push(
+      this.ui.addCommandPaletteCommand({
+        label: 'App Lock: Resume protection',
+        icon: 'lock',
+        onSelected: () => {
+          if (!this._isSuspended()) {
+            this.ui.addToaster({
+              title: 'Already active',
+              message: 'Protection is on. Use “App Lock: Suspend protection” or hold the lock icon to pause.',
+              dismissible: true,
+              autoDestroyTime: 3500,
+            });
+            return;
+          }
+          this._setSuspended(false);
+          this.ui.addToaster({
+            title: 'App Lock resumed',
+            message: 'Idle timer and status bar lock are active again.',
+            dismissible: true,
+            autoDestroyTime: 3000,
+          });
+        },
+      })
+    );
+
     // Activity events to reset idle timer
     this._activityBound = () => this._onActivity();
     const evts = ['mousemove', 'keydown', 'pointerdown', 'scroll', 'touchstart'];
@@ -1774,7 +1830,7 @@ class Plugin extends AppPlugin {
       try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
     }
 
-    if (hasPin && (wasLocked || resumeGate)) {
+    if (hasPin && (wasLocked || resumeGate) && !this._isSuspended()) {
       this._showLockOverlay();
     } else {
       try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
@@ -1782,9 +1838,15 @@ class Plugin extends AppPlugin {
       this._pluginSettingsFlush();
       this._resetIdleTimer();
     }
+
+    setTimeout(() => this._mountStatusBar(), 0);
   }
 
   onUnload() {
+    try { this._statusBarPointerCleanup?.(); } catch (_) {}
+    this._statusBarPointerCleanup = null;
+    try { this._statusItem?.remove?.(); } catch (_) {}
+    this._statusItem = null;
     this._clearIdleTimer();
     this._removeOverlay();
     if (this._pageHideBound) {
@@ -1806,12 +1868,154 @@ class Plugin extends AppPlugin {
 
   _onPageHideResumeGate() {
     if (this._signingOut) return;
+    if (this._isSuspended()) return;
     try {
       if (!localStorage.getItem(this._STORAGE_KEY_HASH)) return;
       if (this._overlayEl) return;
       localStorage.setItem(this._STORAGE_KEY_RESUME_GATE, '1');
       this._pluginSettingsFlush();
     } catch (e) { /* ignore */ }
+  }
+
+  _isSuspended() {
+    try {
+      return localStorage.getItem(this._STORAGE_KEY_SUSPENDED) === '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _setSuspended(on) {
+    try {
+      if (on) localStorage.setItem(this._STORAGE_KEY_SUSPENDED, '1');
+      else localStorage.removeItem(this._STORAGE_KEY_SUSPENDED);
+    } catch (_) {}
+    if (on) this._clearIdleTimer();
+    else this._resetIdleTimer();
+    this._pluginSettingsFlush();
+    this._syncStatusBarAppearance();
+  }
+
+  _toggleSuspended() {
+    const next = !this._isSuspended();
+    this._setSuspended(next);
+    this.ui.addToaster({
+      title: next ? 'App Lock suspended' : 'App Lock resumed',
+      message: next
+        ? 'Hold the icon again to resume. Idle lock is off.'
+        : 'Idle timer and quick lock are on.',
+      dismissible: true,
+      autoDestroyTime: 3200,
+    });
+  }
+
+  /** Status bar uses only `htmlLabel` (never `icon` + `htmlLabel` together — host shows both). */
+  _statusBarActiveHtml() {
+    return (
+      '<span class="tal-sb-lock tal-sb-lock--active" style="display:inline-flex;align-items:center;justify-content:center;vertical-align:middle" aria-hidden="true">' +
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>' +
+      '<rect x="3" y="11" width="18" height="11" rx="2.5"/>' +
+      '</svg></span>'
+    );
+  }
+
+  /** Inline SVG when suspended (slash through lock). */
+  _statusBarSuspendedHtml() {
+    return (
+      '<span class="tal-sb-lock tal-sb-lock--suspended" style="display:inline-flex;align-items:center;justify-content:center;vertical-align:middle" aria-hidden="true">' +
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>' +
+      '<rect x="3" y="11" width="18" height="11" rx="2.5"/>' +
+      '<path d="M4 4l16 16" stroke-width="2.1"/>' +
+      '</svg></span>'
+    );
+  }
+
+  _syncStatusBarAppearance() {
+    if (!this._statusItem) return;
+    try {
+      if (this._isSuspended()) {
+        this._statusItem.setHtmlLabel?.(this._statusBarSuspendedHtml());
+        this._statusItem.setTooltip?.('App Lock suspended — hold to resume; click does not lock');
+      } else {
+        this._statusItem.setHtmlLabel?.(this._statusBarActiveHtml());
+        this._statusItem.setTooltip?.('App Lock — click to lock; hold to suspend idle lock');
+      }
+    } catch (_) {}
+  }
+
+  /**
+   * SDK: `this.ui.addStatusBarItem` (see thymer-plugin-sdk types.d.ts).
+   * Long-press uses pointer events on `getElement()` because `onClick` is click-only.
+   */
+  _mountStatusBar() {
+    if (typeof this.ui.addStatusBarItem !== 'function') return;
+    try {
+      this._statusItem = this.ui.addStatusBarItem({
+        htmlLabel: this._isSuspended() ? this._statusBarSuspendedHtml() : this._statusBarActiveHtml(),
+        tooltip: 'App Lock — click to lock; hold to suspend idle lock',
+      });
+    } catch (_) {
+      return;
+    }
+    this._syncStatusBarAppearance();
+    const el = this._statusItem?.getElement?.();
+    if (!el || typeof el.addEventListener !== 'function') return;
+
+    const HOLD_MS = 780;
+    let holdTimer = null;
+    let longPressHandled = false;
+
+    const onPointerDown = () => {
+      longPressHandled = false;
+      if (holdTimer) clearTimeout(holdTimer);
+      holdTimer = setTimeout(() => {
+        holdTimer = null;
+        longPressHandled = true;
+        this._toggleSuspended();
+      }, HOLD_MS);
+    };
+
+    const clearHoldTimer = () => {
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = null;
+      }
+    };
+
+    const onPointerUp = () => {
+      clearHoldTimer();
+      if (longPressHandled) {
+        longPressHandled = false;
+        return;
+      }
+      if (this._isSuspended()) {
+        this.ui.addToaster({
+          title: 'App Lock suspended',
+          message: 'Hold the lock icon to resume protection.',
+          dismissible: true,
+          autoDestroyTime: 3500,
+        });
+        return;
+      }
+      if (!localStorage.getItem(this._STORAGE_KEY_HASH)) {
+        this._showNoPinToast();
+        return;
+      }
+      this.lock();
+    };
+
+    el.addEventListener('pointerdown', onPointerDown);
+    el.addEventListener('pointerup', onPointerUp);
+    el.addEventListener('pointercancel', clearHoldTimer);
+
+    this._statusBarPointerCleanup = () => {
+      clearHoldTimer();
+      el.removeEventListener('pointerdown', onPointerDown);
+      el.removeEventListener('pointerup', onPointerUp);
+      el.removeEventListener('pointercancel', clearHoldTimer);
+    };
   }
 
   // ─── Public ───────────────────────────────────────────────────────────────
@@ -1827,11 +2031,13 @@ class Plugin extends AppPlugin {
 
   _onActivity() {
     if (this._overlayEl) return;
+    if (this._isSuspended()) return;
     this._resetIdleTimer();
   }
 
   _resetIdleTimer() {
     this._clearIdleTimer();
+    if (this._isSuspended()) return;
     if (!localStorage.getItem(this._STORAGE_KEY_HASH)) return;
     this._idleTimer = setTimeout(() => this.lock(), this._timeoutMs);
   }
@@ -1860,6 +2066,7 @@ class Plugin extends AppPlugin {
     this._detachOverlayFocusGuard();
     this._overlayFocusGuard = (e) => {
       if (!this._overlayEl || this._overlayEl !== overlay) return;
+      if (this._overlayFocusRedirecting) return;
       const t = e.target;
       if (!t || overlay.contains(t)) return;
       const prefer =
@@ -1867,7 +2074,10 @@ class Plugin extends AppPlugin {
         overlay.querySelector('#tal-pin-new') ||
         overlay.querySelector('input:not([disabled]), button:not([disabled])');
       if (prefer && typeof prefer.focus === 'function') {
+        if (prefer === document.activeElement) return;
+        this._overlayFocusRedirecting = true;
         try { prefer.focus({ preventScroll: true }); } catch (_) { try { prefer.focus(); } catch (_) {} }
+        setTimeout(() => { this._overlayFocusRedirecting = false; }, 0);
       }
     };
     document.addEventListener('focusin', this._overlayFocusGuard, true);
@@ -1996,19 +2206,19 @@ class Plugin extends AppPlugin {
     }
 
     // 4. Clear ALL localStorage, then restore PIN hash + Path B mode keys (other plugins)
-    const pluginSettingsModeKeys = {};
+    const pathBModes = {};
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (k && k.startsWith('thymerext_ps_mode_')) pluginSettingsModeKeys[k] = localStorage.getItem(k);
+        if (k && k.startsWith('thymerext_ps_mode_')) pathBModes[k] = localStorage.getItem(k);
       }
     } catch (_) {}
     try {
       localStorage.clear();
       if (pinHash) localStorage.setItem(this._STORAGE_KEY_HASH, pinHash);
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
-      for (const k of Object.keys(pluginSettingsModeKeys)) {
-        const v = pluginSettingsModeKeys[k];
+      for (const k of Object.keys(pathBModes)) {
+        const v = pathBModes[k];
         if (v != null) try { localStorage.setItem(k, v); } catch (_) {}
       }
     } catch (e) { /* ignore */ }
