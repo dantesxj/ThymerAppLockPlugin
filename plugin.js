@@ -491,6 +491,7 @@
     const coll = await findColl(data);
     if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
     await upgradePluginSettingsSchema(data, coll);
+    let slugRegisterSavedOk = false;
     try {
       const base = coll.getConfiguration() || {};
       const fields = Array.isArray(base.fields) ? [...base.fields] : [];
@@ -538,11 +539,12 @@
         fields[idx] = next;
         const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
         if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
+        else slugRegisterSavedOk = true;
       }
     } catch (e) {
       console.error('[ThymerPluginSettings] registerPluginSlug', e);
     }
-    await rewritePluginChoiceCells(coll);
+    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
   }
 
   /**
@@ -619,7 +621,7 @@
           } catch (_) {}
         }
       }
-      await rewritePluginChoiceCells(coll);
+      if (changed) await rewritePluginChoiceCells(coll);
     } catch (e) {
       console.error('[ThymerPluginSettings] upgrade schema', e);
     }
@@ -1064,10 +1066,10 @@
     return named || cands[0];
   }
 
-  async function findColl(data) {
+  function pickCollFromAll(all) {
     try {
-      const pick = (all) => {
-        const list = Array.isArray(all) ? all : [];
+      const pick = (allIn) => {
+        const list = Array.isArray(allIn) ? allIn : [];
         return (
           list.find((c) => collectionDisplayName(c) === COL_NAME) ||
           list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
@@ -1076,8 +1078,27 @@
           null
         );
       };
-      const all = await data.getAllCollections();
       return pick(all) || pickPathBCollectionHeuristic(all) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function hasPluginBackendInAll(all) {
+    if (!Array.isArray(all) || all.length === 0) return false;
+    for (const c of all) {
+      const nm = collectionDisplayName(c);
+      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
+      const cfg = collectionBackendConfiguredTitle(c);
+      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
+    }
+    return !!pickPathBCollectionHeuristic(all);
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return pickCollFromAll(all);
     } catch (_) {
       return null;
     }
@@ -1091,14 +1112,7 @@
     } catch (_) {
       return false;
     }
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      const nm = collectionDisplayName(c);
-      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
-      const cfg = collectionBackendConfiguredTitle(c);
-      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
-    }
-    return !!pickPathBCollectionHeuristic(all);
+    return hasPluginBackendInAll(all);
   }
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
@@ -1195,17 +1209,52 @@
     try {
       let existing = null;
       for (let attempt = 0; attempt < 4; attempt++) {
+        let allAttempt;
+        try {
+          allAttempt = await data.getAllCollections();
+        } catch (_) {
+          allAttempt = null;
+        }
+        if (allAttempt != null) {
+          existing = pickCollFromAll(allAttempt);
+          if (existing) return;
+          if (hasPluginBackendInAll(allAttempt)) return;
+        } else {
+          existing = await findColl(data);
+          if (existing) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
+      }
+      let allPost;
+      try {
+        allPost = await data.getAllCollections();
+      } catch (_) {
+        allPost = null;
+      }
+      if (allPost != null) {
+        existing = pickCollFromAll(allPost);
+        if (existing) return;
+        if (hasPluginBackendInAll(allPost)) return;
+      } else {
         existing = await findColl(data);
         if (existing) return;
         if (await hasPluginBackendOnWorkspace(data)) return;
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
-      existing = await findColl(data);
-      if (existing) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
       await new Promise((r) => setTimeout(r, 120));
-      if (await findColl(data)) return;
-      if (await hasPluginBackendOnWorkspace(data)) return;
+      let allAfterWait;
+      try {
+        allAfterWait = await data.getAllCollections();
+      } catch (_) {
+        allAfterWait = null;
+      }
+      if (allAfterWait != null) {
+        if (pickCollFromAll(allAfterWait)) return;
+        if (hasPluginBackendInAll(allAfterWait)) return;
+      } else {
+        if (await findColl(data)) return;
+        if (await hasPluginBackendOnWorkspace(data)) return;
+      }
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
@@ -1222,8 +1271,19 @@
           }
         }
         if (preCreateLen > 0) {
-          if (await findColl(data)) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          let allPre;
+          try {
+            allPre = await data.getAllCollections();
+          } catch (_) {
+            allPre = null;
+          }
+          if (allPre != null) {
+            if (pickCollFromAll(allPre)) return;
+            if (hasPluginBackendInAll(allPre)) return;
+          } else {
+            if (await findColl(data)) return;
+            if (await hasPluginBackendOnWorkspace(data)) return;
+          }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
           if (DEBUG_COLLECTIONS) {
@@ -1243,15 +1303,37 @@
       const lease = await acquirePluginBackendCreationLease(14000, data);
       if (lease.denied) return;
       try {
-        if (await findColl(data)) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        let allLease;
+        try {
+          allLease = await data.getAllCollections();
+        } catch (_) {
+          allLease = null;
+        }
+        if (allLease != null) {
+          if (pickCollFromAll(allLease)) return;
+          if (hasPluginBackendInAll(allLease)) return;
+        } else {
+          if (await findColl(data)) return;
+          if (await hasPluginBackendOnWorkspace(data)) return;
+        }
         const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
           // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
           for (let i = 0; i < 10; i++) {
             await new Promise((r) => setTimeout(r, 130 + i * 70));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allCont;
+            try {
+              allCont = await data.getAllCollections();
+            } catch (_) {
+              allCont = null;
+            }
+            if (allCont != null) {
+              if (pickCollFromAll(allCont)) return;
+              if (hasPluginBackendInAll(allCont)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
           return;
         }
@@ -1260,8 +1342,19 @@
           // Another plugin/runtime likely just created it; let collection list/indexing settle first.
           for (let i = 0; i < 8; i++) {
             await new Promise((r) => setTimeout(r, 120 + i * 60));
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            let allSettle;
+            try {
+              allSettle = await data.getAllCollections();
+            } catch (_) {
+              allSettle = null;
+            }
+            if (allSettle != null) {
+              if (pickCollFromAll(allSettle)) return;
+              if (hasPluginBackendInAll(allSettle)) return;
+            } else {
+              if (await findColl(data)) return;
+              if (await hasPluginBackendOnWorkspace(data)) return;
+            }
           }
         }
         noteRecentPluginBackendCreateAttempt(data);
@@ -1963,26 +2056,35 @@ class Plugin extends AppPlugin {
     });
   }
 
-  /** Status bar uses only `htmlLabel` (never `icon` + `htmlLabel` together — host shows both). */
+  /**
+   * Compact inline SVG inside a fixed 18×18 box — matches Tabler status icons better than a raw 18px SVG
+   * (avoids looking oversized). Prefer `htmlLabel` over `ti-lock`/`ti-lock-off`: Thymer’s Tabler subset may omit
+   * `ti-lock-off`, which made the suspended state look “empty.”
+   */
   _statusBarActiveHtml() {
-    return (
-      '<span class="tal-sb-lock tal-sb-lock--active" style="display:inline-flex;align-items:center;justify-content:center;vertical-align:middle" aria-hidden="true">' +
-      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">' +
+    const inner =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' +
       '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>' +
       '<rect x="3" y="11" width="18" height="11" rx="2.5"/>' +
-      '</svg></span>'
+      '</svg>';
+    return (
+      '<span class="tal-sb-lock tal-sb-lock--active" style="display:inline-flex;width:18px;height:18px;align-items:center;justify-content:center;line-height:0;vertical-align:middle" aria-hidden="true">' +
+      inner +
+      '</span>'
     );
   }
 
-  /** Inline SVG when suspended (slash through lock). */
   _statusBarSuspendedHtml() {
-    return (
-      '<span class="tal-sb-lock tal-sb-lock--suspended" style="display:inline-flex;align-items:center;justify-content:center;vertical-align:middle" aria-hidden="true">' +
-      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">' +
+    const inner =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' +
       '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>' +
       '<rect x="3" y="11" width="18" height="11" rx="2.5"/>' +
-      '<path d="M4 4l16 16" stroke-width="2.1"/>' +
-      '</svg></span>'
+      '<path d="M4 4l16 16" stroke-width="2"/>' +
+      '</svg>';
+    return (
+      '<span class="tal-sb-lock tal-sb-lock--suspended" style="display:inline-flex;width:18px;height:18px;align-items:center;justify-content:center;line-height:0;vertical-align:middle" aria-hidden="true">' +
+      inner +
+      '</span>'
     );
   }
 
@@ -1996,6 +2098,15 @@ class Plugin extends AppPlugin {
         this._statusItem.setHtmlLabel?.(this._statusBarActiveHtml());
         this._statusItem.setTooltip?.('App Lock — click to lock; hold to suspend idle lock');
       }
+    } catch (_) {}
+  }
+
+  /** Move item toward the end of the status strip (best-effort; some hosts use nested wrappers). */
+  _moveStatusBarItemToEnd() {
+    try {
+      const el = this._statusItem?.getElement?.();
+      const p = el?.parentNode;
+      if (el && p && p.lastElementChild !== el) p.appendChild(el);
     } catch (_) {}
   }
 
@@ -2014,6 +2125,7 @@ class Plugin extends AppPlugin {
       return;
     }
     this._syncStatusBarAppearance();
+    this._moveStatusBarItemToEnd();
     const el = this._statusItem?.getElement?.();
     if (!el || typeof el.addEventListener !== 'function') return;
 
@@ -2063,6 +2175,9 @@ class Plugin extends AppPlugin {
     el.addEventListener('pointerdown', onPointerDown);
     el.addEventListener('pointerup', onPointerUp);
     el.addEventListener('pointercancel', clearHoldTimer);
+
+    // One delayed nudge so late-loading plugins don’t permanently sit to our right; avoid repeated moves on sync.
+    setTimeout(() => this._moveStatusBarItemToEnd(), 600);
 
     this._statusBarPointerCleanup = () => {
       clearHoldTimer();
