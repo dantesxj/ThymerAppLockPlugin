@@ -1117,6 +1117,28 @@
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
   const DATA_ENSURE_P = '__thymerExtDataPluginBackendEnsureP';
+  /** Per-workspace: Plugin Backend already ensured — skip repeat bodies (avoids getAllCollections / lock storms). */
+  const WS_ENSURE_OK_MAP = '__thymerExtPbWorkspaceEnsureOkMap_v1';
+
+  function markWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      if (!h[WS_ENSURE_OK_MAP] || typeof h[WS_ENSURE_OK_MAP] !== 'object') h[WS_ENSURE_OK_MAP] = Object.create(null);
+      h[WS_ENSURE_OK_MAP][slug] = true;
+    } catch (_) {}
+  }
+
+  function isWorkspacePluginBackendEnsureDone(data) {
+    try {
+      const slug = workspaceSlugFromData(data);
+      const h = getSharedDeduplicationWindow();
+      const m = h[WS_ENSURE_OK_MAP];
+      return !!(m && m[slug]);
+    } catch (_) {
+      return false;
+    }
+  }
 
   function dlogPathB(phase, extra) {
     if (!DEBUG_COLLECTIONS) return;
@@ -1191,22 +1213,46 @@
   }
 
   async function runPluginBackendEnsureBody(data) {
+    if (data && isWorkspacePluginBackendEnsureDone(data)) return;
     if (DEBUG_COLLECTIONS) {
       dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
       try {
         if (data && data.getAllCollections) {
           const a = await data.getAllCollections();
-          const collNames = (Array.isArray(a) ? a : []).map((c) => {
+          const list = Array.isArray(a) ? a : [];
+          const collNames = list.map((c) => {
             try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
           });
           dlogPathB('ensureBody_collections', { count: (collNames && collNames.length) || 0, names: (collNames || []).slice(0, 40) });
           if (data && data.getAllCollections) touchGetAllSanityFromCount((collNames && collNames.length) || 0);
+          const dupExact = list.filter((c) => {
+            try {
+              const nm = collectionDisplayName(c);
+              return nm === COL_NAME || nm === COL_NAME_LEGACY;
+            } catch (__) {
+              return false;
+            }
+          });
+          if (dupExact.length > 1) {
+            dlogPathB('duplicate_plugin_backend_named_collections', {
+              count: dupExact.length,
+              guids: dupExact.map((c) => {
+                try {
+                  return c.getGuid?.() || null;
+                } catch (__) {
+                  return null;
+                }
+              }),
+              doc: 'docs/PLUGIN_BACKEND_DUPLICATE_HYGIENE.md',
+            });
+          }
         }
       } catch (e) {
         dlogPathB('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
       }
     }
     try {
+      const markPbOk = () => markWorkspacePluginBackendEnsureDone(data);
       let existing = null;
       for (let attempt = 0; attempt < 4; attempt++) {
         let allAttempt;
@@ -1217,12 +1263,24 @@
         }
         if (allAttempt != null) {
           existing = pickCollFromAll(allAttempt);
-          if (existing) return;
-          if (hasPluginBackendInAll(allAttempt)) return;
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allAttempt)) {
+            markPbOk();
+            return;
+          }
         } else {
           existing = await findColl(data);
-          if (existing) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          if (existing) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
         }
         if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
       }
@@ -1234,12 +1292,24 @@
       }
       if (allPost != null) {
         existing = pickCollFromAll(allPost);
-        if (existing) return;
-        if (hasPluginBackendInAll(allPost)) return;
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allPost)) {
+          markPbOk();
+          return;
+        }
       } else {
         existing = await findColl(data);
-        if (existing) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        if (existing) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
       }
       await new Promise((r) => setTimeout(r, 120));
       let allAfterWait;
@@ -1249,11 +1319,23 @@
         allAfterWait = null;
       }
       if (allAfterWait != null) {
-        if (pickCollFromAll(allAfterWait)) return;
-        if (hasPluginBackendInAll(allAfterWait)) return;
+        if (pickCollFromAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
+        if (hasPluginBackendInAll(allAfterWait)) {
+          markPbOk();
+          return;
+        }
       } else {
-        if (await findColl(data)) return;
-        if (await hasPluginBackendOnWorkspace(data)) return;
+        if (await findColl(data)) {
+          markPbOk();
+          return;
+        }
+        if (await hasPluginBackendOnWorkspace(data)) {
+          markPbOk();
+          return;
+        }
       }
       let preCreateLen = 0;
       try {
@@ -1278,11 +1360,23 @@
             allPre = null;
           }
           if (allPre != null) {
-            if (pickCollFromAll(allPre)) return;
-            if (hasPluginBackendInAll(allPre)) return;
+            if (pickCollFromAll(allPre)) {
+              markPbOk();
+              return;
+            }
+            if (hasPluginBackendInAll(allPre)) {
+              markPbOk();
+              return;
+            }
           } else {
-            if (await findColl(data)) return;
-            if (await hasPluginBackendOnWorkspace(data)) return;
+            if (await findColl(data)) {
+              markPbOk();
+              return;
+            }
+            if (await hasPluginBackendOnWorkspace(data)) {
+              markPbOk();
+              return;
+            }
           }
         }
         if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
@@ -1310,11 +1404,23 @@
           allLease = null;
         }
         if (allLease != null) {
-          if (pickCollFromAll(allLease)) return;
-          if (hasPluginBackendInAll(allLease)) return;
+          if (pickCollFromAll(allLease)) {
+            markPbOk();
+            return;
+          }
+          if (hasPluginBackendInAll(allLease)) {
+            markPbOk();
+            return;
+          }
         } else {
-          if (await findColl(data)) return;
-          if (await hasPluginBackendOnWorkspace(data)) return;
+          if (await findColl(data)) {
+            markPbOk();
+            return;
+          }
+          if (await hasPluginBackendOnWorkspace(data)) {
+            markPbOk();
+            return;
+          }
         }
         const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
         if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
@@ -1328,11 +1434,23 @@
               allCont = null;
             }
             if (allCont != null) {
-              if (pickCollFromAll(allCont)) return;
-              if (hasPluginBackendInAll(allCont)) return;
+              if (pickCollFromAll(allCont)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allCont)) {
+                markPbOk();
+                return;
+              }
             } else {
-              if (await findColl(data)) return;
-              if (await hasPluginBackendOnWorkspace(data)) return;
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
             }
           }
           return;
@@ -1349,11 +1467,23 @@
               allSettle = null;
             }
             if (allSettle != null) {
-              if (pickCollFromAll(allSettle)) return;
-              if (hasPluginBackendInAll(allSettle)) return;
+              if (pickCollFromAll(allSettle)) {
+                markPbOk();
+                return;
+              }
+              if (hasPluginBackendInAll(allSettle)) {
+                markPbOk();
+                return;
+              }
             } else {
-              if (await findColl(data)) return;
-              if (await hasPluginBackendOnWorkspace(data)) return;
+              if (await findColl(data)) {
+                markPbOk();
+                return;
+              }
+              if (await hasPluginBackendOnWorkspace(data)) {
+                markPbOk();
+                return;
+              }
             }
           }
         }
@@ -1363,6 +1493,7 @@
           if (DEBUG_COLLECTIONS) {
             dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
           }
+          markPbOk();
           return;
         }
         const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
@@ -1380,6 +1511,7 @@
         }
         if (ok === false) return;
         noteRecentPluginBackendCreate(data);
+        markPbOk();
         await new Promise((r) => setTimeout(r, 250));
       } finally {
         try {
@@ -1405,6 +1537,12 @@
   }
 
   function ensurePluginSettingsCollection(data) {
+    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
+      return Promise.resolve();
+    }
+    if (isWorkspacePluginBackendEnsureDone(data)) {
+      return Promise.resolve();
+    }
     if (DEBUG_COLLECTIONS) {
       let dHint = 'no-data';
       try {
@@ -1418,9 +1556,6 @@
         dHint = 'err';
       }
       dlogPathB('ensurePluginSettingsCollection', { dataHint: dHint, dataExpand: (() => { try { if (!data) return { ok: false }; return { hasDataEnsure: !!data[DATA_ENSURE_P] }; } catch (_) { return { ok: 'throw' }; } })(), pathB: pathBWindowSnapshot() });
-    }
-    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
-      return Promise.resolve();
     }
     try {
       if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
