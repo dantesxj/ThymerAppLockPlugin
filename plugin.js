@@ -2376,6 +2376,7 @@
 
   g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
   g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
   g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
   g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
   g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
