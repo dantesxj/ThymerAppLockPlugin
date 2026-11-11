@@ -55,14 +55,11 @@ class Plugin extends AppPlugin {
  * Instantiated by Tier2. No vault I/O. Path B via host.
  *
  * Behaviour:
- *  - Fresh login: NO lock screen. Idle timer starts silently.
- *  - After 2 min idle: lock screen appears, requiring PIN.
- *  - Lock screen: enter PIN to unlock, OR sign out (back to Thymer login).
- *  - Forgot PIN: sign out → log back in → use "Change Lock PIN" in Command Palette.
- *  - Command Palette → "Lock App": manual lock at any time.
- *  - Command Palette → "Change Lock PIN": set/change PIN freely — no current PIN required.
- *  - Status bar lock icon: click = lock now; hold ≈0.5s = suspend/resume idle protection.
- *  - Command Palette → suspend/resume protection (same as hold toggle).
+ *  - PIN present + not suspended → lock on cold open / tab-app reopen (signed-in session).
+ *  - True post-sign-out login: one unlocked session (fresh-login flag) to Change Lock PIN.
+ *  - After idle timeout: lock screen; unlock with PIN, or sign out.
+ *  - Path B syncs PIN hash only — lock/suspend/resume-gate stay device-local.
+ *  - Status bar: click = lock; hold ≈0.5s = suspend/resume (local only).
  *
  * PIN is stored as a SHA-256 hash in localStorage — never the PIN itself.
  *
@@ -71,12 +68,8 @@ class Plugin extends AppPlugin {
  */
 
 function alCopyProdLsIfEmpty() {
-  const pairs = [
-    ['dawn:applock_pin_hash_v1', 'thymer_applock_pin_hash_v1'],
-    ['dawn:applock_state_v1', 'thymer_applock_state_v1'],
-    ['dawn:applock_resume_gate_v1', 'thymer_applock_resume_gate_v1'],
-    ['dawn:applock_suspended_v1', 'thymer_applock_suspended_v1'],
-  ];
+  // Hash only — never migrate session keys (state/suspend/gate) from prod aliases.
+  const pairs = [['dawn:applock_pin_hash_v1', 'thymer_applock_pin_hash_v1']];
   for (const [dawnKey, prodKey] of pairs) {
     try {
       if (String(localStorage.getItem(dawnKey) || '').trim()) continue;
@@ -105,6 +98,8 @@ class DawnAppLock {
     this._STORAGE_KEY_STATE = 'dawn:applock_state_v1';
     this._STORAGE_KEY_RESUME_GATE = 'dawn:applock_resume_gate_v1';
     this._STORAGE_KEY_SUSPENDED = 'dawn:applock_suspended_v1';
+    this._STORAGE_KEY_FRESH_LOGIN = 'dawn:applock_fresh_login_v1';
+    this._SESSION_UNLOCKED = 'dawn:applock_session_unlocked_v1';
   }
 
   getConfiguration() {
@@ -115,15 +110,122 @@ class DawnAppLock {
     }
   }
 
+  /** Path B: PIN hash only — never sync lock/suspend/resume (cross-device soft-disable). */
   _pluginSettingsMirrorKeys() {
-    return [
-      this._STORAGE_KEY_HASH, this._STORAGE_KEY_STATE, this._STORAGE_KEY_RESUME_GATE, this._STORAGE_KEY_SUSPENDED,
-      'thymer_applock_pin_hash_v1', 'thymer_applock_state_v1', 'thymer_applock_resume_gate_v1', 'thymer_applock_suspended_v1',
-    ];
+    return [this._STORAGE_KEY_HASH, 'thymer_applock_pin_hash_v1'];
   }
 
   _pluginSettingsFlush() {
     globalThis.ThymerPluginSettings?.scheduleFlush?.(this._host || this, () => this._pluginSettingsMirrorKeys());
+  }
+
+  _sessionKeyNames() {
+    return [
+      this._STORAGE_KEY_STATE,
+      this._STORAGE_KEY_RESUME_GATE,
+      this._STORAGE_KEY_SUSPENDED,
+      'thymer_applock_state_v1',
+      'thymer_applock_resume_gate_v1',
+      'thymer_applock_suspended_v1',
+    ];
+  }
+
+  _snapshotSessionKeys() {
+    const snap = {};
+    for (const k of this._sessionKeyNames()) {
+      try {
+        snap[k] = localStorage.getItem(k);
+      } catch (_) {
+        snap[k] = null;
+      }
+    }
+    return snap;
+  }
+
+  /** Device-local session keys win over stale Path B vault pollution. */
+  _restoreSessionKeys(snap) {
+    if (!snap) return;
+    for (const k of this._sessionKeyNames()) {
+      try {
+        const v = snap[k];
+        if (v == null || v === '') localStorage.removeItem(k);
+        else localStorage.setItem(k, v);
+      } catch (_) {}
+    }
+  }
+
+  _isSessionUnlocked() {
+    try {
+      return sessionStorage.getItem(this._SESSION_UNLOCKED) === '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _setSessionUnlocked(on) {
+    try {
+      if (on) sessionStorage.setItem(this._SESSION_UNLOCKED, '1');
+      else sessionStorage.removeItem(this._SESSION_UNLOCKED);
+    } catch (_) {}
+  }
+
+  /**
+   * Lock when PIN exists unless: local suspend, this-tab session unlock, or one-shot post-sign-out.
+   */
+  _applyBootLockPolicy() {
+    const hasPin = !!localStorage.getItem(this._STORAGE_KEY_HASH);
+
+    let freshLogin = false;
+    try {
+      freshLogin = localStorage.getItem(this._STORAGE_KEY_FRESH_LOGIN) === '1';
+      if (freshLogin) localStorage.removeItem(this._STORAGE_KEY_FRESH_LOGIN);
+    } catch (_) {}
+
+    try {
+      localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE);
+      localStorage.removeItem('thymer_applock_resume_gate_v1');
+    } catch (_) {}
+
+    if (!hasPin) {
+      try {
+        localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      } catch (_) {}
+      return;
+    }
+
+    if (this._isSuspended()) {
+      try {
+        localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      } catch (_) {}
+      this._clearIdleTimer();
+      return;
+    }
+
+    if (freshLogin) {
+      this._setSessionUnlocked(true);
+      try {
+        localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      } catch (_) {}
+      this._resetIdleTimer();
+      return;
+    }
+
+    if (this._isSessionUnlocked()) {
+      if (!this._overlayEl) this._resetIdleTimer();
+      return;
+    }
+
+    if (this._overlayEl) {
+      try {
+        localStorage.setItem(this._STORAGE_KEY_STATE, 'locked');
+      } catch (_) {}
+      return;
+    }
+
+    try {
+      localStorage.setItem(this._STORAGE_KEY_STATE, 'locked');
+    } catch (_) {}
+    this._showLockOverlay();
   }
 
   async _appLockDeferredPathB() {
@@ -131,6 +233,7 @@ class DawnAppLock {
       alCopyProdLsIfEmpty();
       const api = globalThis.ThymerPluginSettings;
       if (!api?.init || (api.__pathBStub && !api.__dawnPathBHost)) return;
+      const sessionSnap = this._snapshotSessionKeys();
       await api.init({
         plugin: this._host || this,
         pluginId: 'app-lock',
@@ -138,8 +241,16 @@ class DawnAppLock {
         data: this.data,
         ui: this.ui,
         mirrorKeys: () => this._pluginSettingsMirrorKeys(),
-        awaitHydrate: false,
-        onHydrated: () => alCopyProdLsIfEmpty(),
+        awaitHydrate: true,
+        onHydrated: () => {
+          try {
+            alCopyProdLsIfEmpty();
+            this._restoreSessionKeys(sessionSnap);
+            this._applyBootLockPolicy();
+          } catch (e) {
+            console.warn('[App Lock] onHydrated', e);
+          }
+        },
       });
       this._pluginSettingsPluginId = 'app-lock';
       this._pluginSettingsSyncMode = 'synced';
@@ -148,6 +259,8 @@ class DawnAppLock {
         this._host._pluginSettingsSyncMode = 'synced';
       }
       alCopyProdLsIfEmpty();
+      this._restoreSessionKeys(sessionSnap);
+      this._applyBootLockPolicy();
     } catch (e) {
       console.warn('[App Lock] Path B init', e);
     }
@@ -155,11 +268,12 @@ class DawnAppLock {
 
   attach() {
     alCopyProdLsIfEmpty();
-    void this._appLockDeferredPathB();
     const cfg = this.getConfiguration?.()?.custom || {};
     this._timeoutMs = Math.max(10, Number(cfg.lockTimeout) || 120) * 1000;
     this._signingOut = false;
     this._pageHideBound = null;
+    this._visibilityBound = null;
+    this._beforeUnloadBound = null;
 
     this._injectStyles();
 
@@ -206,7 +320,7 @@ class DawnAppLock {
           this._setSuspended(true);
           this.ui.addToaster({
             title: 'App Lock suspended',
-            message: 'Hold the status bar lock icon or use the command palette to resume.',
+            message: 'Hold the status bar lock icon or use the command palette to resume. Suspend is this device only.',
             dismissible: true,
             autoDestroyTime: 4000,
           });
@@ -246,32 +360,28 @@ class DawnAppLock {
       document.addEventListener(ev, this._activityBound, { passive: true, capture: true });
     }
 
-    // Next cold open / reload with PIN: require unlock (desktop restore, etc.)
-    this._pageHideBound = () => this._onPageHideResumeGate();
+    // Close / unload → next open must PIN. Tab blur only stamps LS (keeps this-tab session).
+    this._pageHideBound = () => this._armResumeGate({ clearSession: true });
+    this._beforeUnloadBound = () => this._armResumeGate({ clearSession: true });
+    this._visibilityBound = () => {
+      if (document.visibilityState === 'hidden') this._armResumeGate({ clearSession: false });
+    };
+    this._pageShowBound = (ev) => {
+      if (ev?.persisted) this._applyBootLockPolicy();
+    };
     window.addEventListener('pagehide', this._pageHideBound);
+    window.addEventListener('beforeunload', this._beforeUnloadBound);
+    window.addEventListener('pageshow', this._pageShowBound);
+    document.addEventListener('visibilitychange', this._visibilityBound);
 
-    // Determine initial state
-    const hasPin     = !!localStorage.getItem(this._STORAGE_KEY_HASH);
-    const wasLocked  = localStorage.getItem(this._STORAGE_KEY_STATE) === 'locked';
-    const resumeGate = localStorage.getItem(this._STORAGE_KEY_RESUME_GATE) === '1';
-
-    if (resumeGate && hasPin) {
-      try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
-    }
-
-    if (hasPin && (wasLocked || resumeGate) && !this._isSuspended()) {
-      this._showLockOverlay();
-    } else {
-      try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
-      localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
-      this._pluginSettingsFlush();
-      this._resetIdleTimer();
-    }
+    this._applyBootLockPolicy();
+    void this._appLockDeferredPathB();
 
     setTimeout(() => this._mountStatusBar(), 0);
   }
 
   detach() {
+    this._armResumeGate({ clearSession: true });
     try { this._statusBarPointerCleanup?.(); } catch (_) {}
     this._statusBarPointerCleanup = null;
     try { this._statusItem?.remove?.(); } catch (_) {}
@@ -281,6 +391,18 @@ class DawnAppLock {
     if (this._pageHideBound) {
       try { window.removeEventListener('pagehide', this._pageHideBound); } catch (e) { /* ignore */ }
       this._pageHideBound = null;
+    }
+    if (this._beforeUnloadBound) {
+      try { window.removeEventListener('beforeunload', this._beforeUnloadBound); } catch (e) { /* ignore */ }
+      this._beforeUnloadBound = null;
+    }
+    if (this._pageShowBound) {
+      try { window.removeEventListener('pageshow', this._pageShowBound); } catch (e) { /* ignore */ }
+      this._pageShowBound = null;
+    }
+    if (this._visibilityBound) {
+      try { document.removeEventListener('visibilitychange', this._visibilityBound); } catch (e) { /* ignore */ }
+      this._visibilityBound = null;
     }
     for (const cmd of this._commands) {
       try { cmd?.remove?.(); } catch (e) { /* ignore */ }
@@ -295,14 +417,15 @@ class DawnAppLock {
     }
   }
 
-  _onPageHideResumeGate() {
+  _armResumeGate({ clearSession = true } = {}) {
     if (this._signingOut) return;
     if (this._isSuspended()) return;
     try {
       if (!localStorage.getItem(this._STORAGE_KEY_HASH)) return;
-      if (this._overlayEl) return;
+      if (clearSession) this._setSessionUnlocked(false);
       localStorage.setItem(this._STORAGE_KEY_RESUME_GATE, '1');
-      this._pluginSettingsFlush();
+      localStorage.setItem(this._STORAGE_KEY_STATE, 'locked');
+      // Device-local only — do not Path B flush session keys.
     } catch (e) { /* ignore */ }
   }
 
@@ -473,8 +596,8 @@ class DawnAppLock {
 
   lock() {
     this._clearIdleTimer();
+    this._setSessionUnlocked(false);
     localStorage.setItem(this._STORAGE_KEY_STATE, 'locked');
-    this._pluginSettingsFlush();
     this._showLockOverlay();
   }
 
@@ -624,10 +747,11 @@ class DawnAppLock {
 
   async _signOut() {
     this._signingOut = true;
-    // Keep PIN hash but mark as unlocked (fresh login won't trigger lock)
+    // Keep PIN hash; one post-login session may skip lock so user can Change Lock PIN.
     const pinHash = localStorage.getItem(this._STORAGE_KEY_HASH);
     localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
     try { localStorage.removeItem(this._STORAGE_KEY_RESUME_GATE); } catch (e) { /* ignore */ }
+    try { this._setSessionUnlocked(false); } catch (_) {}
 
     // 1. Unregister all Service Workers
     try {
@@ -666,7 +790,10 @@ class DawnAppLock {
     } catch (_) {}
     try {
       localStorage.clear();
-      if (pinHash) localStorage.setItem(this._STORAGE_KEY_HASH, pinHash);
+      if (pinHash) {
+        localStorage.setItem(this._STORAGE_KEY_HASH, pinHash);
+        localStorage.setItem(this._STORAGE_KEY_FRESH_LOGIN, '1');
+      }
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
       for (const k of Object.keys(pathBModes)) {
         const v = pathBModes[k];
@@ -749,7 +876,7 @@ class DawnAppLock {
 
         <p class="tal-hint">
           Forgot your PIN? Sign out and log back in —<br>
-          no PIN is required on a fresh login.<br>
+          you get one unlocked session to reset it.<br>
           Then use <strong>Command Palette → Change Lock PIN</strong>.
         </p>
       </div>
@@ -786,7 +913,7 @@ class DawnAppLock {
       if (hash === storedHash) {
         overlay.classList.add('tal-overlay--unlocking');
         localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
-        this._pluginSettingsFlush();
+        this._setSessionUnlocked(true);
         setTimeout(() => {
           this._removeOverlay();
           this._resetIdleTimer();
@@ -872,7 +999,8 @@ class DawnAppLock {
         </div>
 
         <p class="tal-hint">
-          Forgot your PIN? Sign out and log back in —<br>no PIN is required on a fresh login.
+          Forgot your PIN? Sign out and log back in —<br>
+          one unlocked session to set a new PIN.
         </p>
       </div>
     `;
@@ -913,6 +1041,7 @@ class DawnAppLock {
       localStorage.setItem(this._STORAGE_KEY_HASH, hash);
       try { localStorage.setItem('thymer_applock_pin_hash_v1', hash); } catch (_) {}
       localStorage.setItem(this._STORAGE_KEY_STATE, 'unlocked');
+      this._setSessionUnlocked(true);
       this._pluginSettingsFlush();
 
       this._showMsg(msg, 'PIN saved!', 'ok');
